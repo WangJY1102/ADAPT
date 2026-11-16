@@ -1,125 +1,176 @@
-import torch
-import numpy as np
-from    FERDB import FER_train
-from    FERDB import FER_test
+"""Run source-domain meta-training and cross-domain adaptation from this backup."""
 import argparse
-from meta_yolo import Meta
-from    torch.utils.data import DataLoader
 from collections import defaultdict
-
+from datetime import datetime
+import json
+from pathlib import Path
 import random
+import warnings
+import numpy as np
 import torch
-from functools import partial
+from RAFDB import RAF_train, RAF_test
+from meta_yolo import Meta
+
+PROJECT = Path(__file__).resolve().parent
+
 
 def collate_4_diff_tasks(batch, dataset):
-    """
-    每次随机统一 n_way，再从 dataset 里重新采 n  个 *不同* 任务
-    """
-    n_way = random.choice([3, 4, 5])          # 统一当前 step 的 n_way
-    dataset.set_n_way(n_way)                  
-
-    sx, sy, qx, qy = [], [], [], []
-    for _ in range(4): 
-        sxi, syi, qxi, qyi, _ = dataset[0]
-        sx.append(sxi)
-        sy.append(syi)
-        qx.append(qxi)
-        qy.append(qyi)
-
-    return torch.stack(sx), torch.stack(sy), torch.stack(qx), torch.stack(qy), [n_way] * 4
-
-def main():
-    torch.manual_seed(222)
-    torch.cuda.manual_seed_all(222)
-    np.random.seed(222)
-
-    print("使用预训练权重进行ADAPT训练")
-    print(args)
-
-    device = torch.device('cuda')
-    adapt = Meta(args, config=None).to(device)
-
-    # 获取可训练参数数量
-    trainable_params = sum(p.numel() for p in adapt.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in adapt.parameters())
-    
-    print(f'总参数量: {total_params}')
-    print(f'可训练参数量: {trainable_params}')
-    print(f'冻结参数量: {total_params - trainable_params}')
-    print(adapt)
-
-    # 加载数据集
-    mini = FER_train('FER-2013/', mode='train', n_way=None, k_shot=args.k_spt,
-                        k_query=args.k_qry, batchsz=1, resize=args.imgsz)
-    mini_test = FER_test('JAFFE_JPG/', mode='test', n_way=args.n_way, k_shot=args.k_spt,
-                             k_query=args.k_qry, batchsz=300, resize=args.imgsz)
-    db = DataLoader(mini, batch_size=1,
-                              shuffle=False,
-                              num_workers=0,        # 多线程需额外处理，先设 0
-                              pin_memory=True,
-                              collate_fn=partial(collate_4_diff_tasks, dataset=mini))
-
-    for epoch in range(args.epoch//3000):
-        # fetch meta_batchsz num of episode each time
-
-        for step, (x_spt, y_spt, x_qry, y_qry, n_way_list) in enumerate(db):
-            x_spt, y_spt, x_qry, y_qry = x_spt.to(device), y_spt.to(device), x_qry.to(device), y_qry.to(device)
-            # print('>>> N_CLASS:', type(n_way_list), n_way_list)
-            n_way = n_way_list[0]
-
-            accs, loss_q = adapt(x_spt, y_spt, x_qry, y_qry, n_way)
-
-            if step % 30 == 0:
-                print('step:', step, '\ttraining acc:', accs, '\ttraining loss:', loss_q)
-
-            if step % 180 == 0: # evaluation
-            # if step % 180 == 0:  # evaluation
-                db_test = DataLoader(mini_test, 1, shuffle=True, num_workers=1, pin_memory=True)
-                accs_all_test = []
-                # 1. 总计数器
-                total_correct = defaultdict(int)
-                total_count = defaultdict(int)
-                n_tasks = 0
-
-                for x_spt, y_spt, x_qry, y_qry , idx2emotion in db_test:
-                    x_spt, y_spt, x_qry, y_qry = x_spt.squeeze(0).to(device), y_spt.squeeze(0).to(device), \
-                                                 x_qry.squeeze(0).to(device), y_qry.squeeze(0).to(device)
-                    # print('idx2emotion:', idx2emotion)
-
-                    new_dict = {k: v[0] for k, v in idx2emotion.items()}
-                    # print('Fixed mapping:', new_dict)
-
-                    accs, task_correct, task_total = adapt.finetunning(x_spt, y_spt, x_qry, y_qry, new_dict)
-                    accs_all_test.append(accs)
+    n_way = random.choice([n for n in (3, 4, 5) if n <= dataset.cls_num])
+    dataset.set_n_way(n_way)
+    tasks = [dataset[i] for i in range(len(batch))]
+    return (*[torch.stack([task[i] for task in tasks]) for i in range(4)],
+            [n_way] * len(tasks))
 
 
-                    for emo, c in task_correct.items():
-                        total_correct[emo] += c
-                        total_count[emo] += task_total[emo]
-                    n_tasks += 1
+def resolve_path(value):
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT / path
 
-                # [b, update_step+1]
-                accs = np.array(accs_all_test).mean(axis=0).astype(np.float16)
-                print('Test acc:', accs)
+
+def evaluate(model, dataset, device):
+    results, total_correct, total_count = [], defaultdict(int), defaultdict(int)
+    for index in range(len(dataset)):
+        sx, sy, qx, qy, mapping = dataset[index]
+        trajectory, correct, count = model.finetunning(
+            sx.to(device), sy.to(device), qx.to(device), qy.to(device), mapping)
+        results.append(trajectory)
+        for name, number in count.items():
+            total_count[name] += number
+            total_correct[name] += correct[name]
+    values = np.stack(results)
+    return {
+        'episodes': len(dataset), 'n_way': dataset.n_way,
+        'k_shot': dataset.k_shot, 'k_query': dataset.k_query,
+        'accuracy_by_step': values.mean(0).tolist(),
+        'episode_std_by_step': values.std(0, ddof=1).tolist() if len(values) > 1 else None,
+        'per_class': {name: {'correct': total_correct[name], 'total': count,
+                            'accuracy': total_correct[name] / count}
+                      for name, count in sorted(total_count.items())},
+        'macro_accuracy': float(np.mean([total_correct[name] / count
+                                        for name, count in total_count.items()])),
+    }
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--epoch', type=int, default=30000, help='Legacy name: total meta iterations')
+    p.add_argument('--steps', type=int, default=None, help='Override number of meta iterations')
+    p.add_argument('--n_way', type=int, default=5, help='Evaluation way; fixed training way with --fixed-way')
+    p.add_argument('--fixed-way', action='store_true')
+    p.add_argument('--n-min', type=int, default=3)
+    p.add_argument('--n-max', type=int, default=5)
+    p.add_argument('--k_spt', type=int, default=5)
+    p.add_argument('--k_qry', type=int, default=15)
+    p.add_argument('--imgsz', type=int, default=128)
+    p.add_argument('--imgc', type=int, default=3, choices=[3])
+    p.add_argument('--task_num', type=int, default=4)
+    p.add_argument('--meta_lr', type=float, default=0.0005)
+    p.add_argument('--update_lr', type=float, default=0.005)
+    p.add_argument('--update_step', type=int, default=5)
+    p.add_argument('--update_step_test', type=int, default=10)
+    p.add_argument('--pretrained_path', default=None)
+    p.add_argument('--freeze_backbone', action='store_true', default=True)
+    p.add_argument('--no_freeze_backbone', dest='freeze_backbone', action='store_false')
+    p.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    p.add_argument('--seed', type=int, default=222)
+    p.add_argument('--cpu-threads', type=int, default=4)
+    p.add_argument('--train-root', default='FER-2013')
+    p.add_argument('--train-split', default='train')
+    p.add_argument('--eval-root', default='JAFFE_JPG')
+    p.add_argument('--eval-split', default='test')
+    p.add_argument('--eval-episodes', type=int, default=300)
+    p.add_argument('--eval-every', type=int, default=180)
+    p.add_argument('--log-every', type=int, default=30)
+    p.add_argument('--save-every', type=int, default=180)
+    p.add_argument('--run-dir', default=None)
+    p.add_argument('--resume', default=None)
+    return p
+
+
+def main(args=None):
+    args = parser().parse_args() if args is None else args
+    steps = args.steps if args.steps is not None else args.epoch
+    if min(steps, args.task_num, args.eval_episodes, args.log_every,
+           args.eval_every, args.save_every, args.cpu_threads) < 1:
+        raise ValueError('Step counts, episode counts and thread counts must be positive')
+    if args.imgsz < 32 or args.imgsz % 32:
+        raise ValueError('This YOLO/Mamba backbone requires image size divisible by 32')
+    torch.set_num_threads(args.cpu_threads)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    cuda_available = torch.cuda.is_available()
+    if args.device == 'cuda' and not cuda_available:
+        raise RuntimeError('CUDA is unavailable; choose --device cpu or auto')
+    device = torch.device('cuda' if args.device == 'auto' and cuda_available else
+                          ('cpu' if args.device == 'auto' else args.device))
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(args.seed)
+    print(f'Python/PyTorch runtime: torch={torch.__version__}; device={device}', flush=True)
+    if args.pretrained_path:
+        args.pretrained_path = str(resolve_path(args.pretrained_path))
+    if args.freeze_backbone and args.pretrained_path is None and args.resume is None:
+        warnings.warn('Backbone is frozen without pretrained weights. This is only a runtime check; '
+                      'use --pretrained_path or --no_freeze_backbone for training.')
+    train = RAF_train(resolve_path(args.train_root), args.train_split, steps * args.task_num,
+                      args.n_way, args.k_spt, args.k_qry, args.imgsz)
+    test = RAF_test(resolve_path(args.eval_root), args.eval_split, args.eval_episodes,
+                    args.n_way, args.k_spt, args.k_qry, args.imgsz)
+    if not args.fixed_way and not 1 <= args.n_min <= args.n_max <= train.cls_num:
+        raise ValueError('Invalid dynamic way range for the source dataset')
+    model = Meta(args).to(device)
+    run_dir = resolve_path(args.run_dir or ('runs/' + datetime.now().strftime('%Y%m%d-%H%M%S')))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / 'config.json').write_text(json.dumps(vars(args), indent=2), encoding='utf-8')
+    events = run_dir / 'metrics.jsonl'
+    start = 0
+    if args.resume:
+        checkpoint = torch.load(resolve_path(args.resume), map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model'])
+        model.meta_optim.load_state_dict(checkpoint['optimizer'])
+        start = checkpoint['step']
+        if 'rng_state' in checkpoint:
+            rng = checkpoint['rng_state']
+            random.setstate(rng['python'])
+            np.random.set_state(rng['numpy'])
+            torch.set_rng_state(rng['torch'].cpu())
+            if device.type == 'cuda' and rng.get('cuda') is not None:
+                torch.cuda.set_rng_state_all([state.cpu() for state in rng['cuda']])
+    print(f'Train classes: {train.cls_names}; target classes: {test.cls_names}', flush=True)
+    print(f'Run directory: {run_dir}', flush=True)
+
+    def record(value):
+        with events.open('a', encoding='utf-8') as output:
+            output.write(json.dumps(value) + '\n')
+
+    def save(step):
+        torch.save({'model': model.state_dict(), 'optimizer': model.meta_optim.state_dict(),
+                    'step': step, 'config': vars(args),
+                    'rng_state': {'python': random.getstate(), 'numpy': np.random.get_state(),
+                                  'torch': torch.get_rng_state(),
+                                  'cuda': torch.cuda.get_rng_state_all() if device.type == 'cuda' else None}},
+                   run_dir / 'last.pt')
+
+    for step in range(start, steps):
+        n_way = args.n_way if args.fixed_way else random.randint(args.n_min, args.n_max)
+        train.set_n_way(n_way)
+        tasks = [train[i] for i in range(args.task_num)]
+        tensors = [torch.stack([task[i] for task in tasks]).to(device) for i in range(4)]
+        accuracy, loss = model(*tensors, n_way)
+        record({'type': 'train', 'step': step + 1, 'n_way': n_way, 'loss': loss.item(),
+                'accuracy_by_step': accuracy.tolist(), 'grad_norm': model.last_grad_norm,
+                'basis_grad_norm': model.last_basis_grad_norm})
+        if step == start or (step + 1) % args.log_every == 0 or step + 1 == steps:
+            print(f'Step {step+1}/{steps}: {n_way}-way; loss={loss.item():.6f}; '
+                  f'accuracy={accuracy.tolist()}; grad_norm={model.last_grad_norm:.6g}', flush=True)
+        if (step + 1) % args.eval_every == 0 or step + 1 == steps:
+            result = evaluate(model, test, device)
+            record({'type': 'evaluation', 'step': step + 1, **result})
+            print('Evaluation: ' + json.dumps(result), flush=True)
+        if (step + 1) % args.save_every == 0 or step + 1 == steps:
+            save(step + 1)
+    print(f'Completed; checkpoint={run_dir / "last.pt"}', flush=True)
+
 
 if __name__ == '__main__':
-    argparser = argparse.ArgumentParser()
-    argparser.add_argument('--epoch', type=int, help='epoch number', default=30000)
-    argparser.add_argument('--n_way', type=int, help='n way', default=4)
-    argparser.add_argument('--k_spt', type=int, help='k shot for support set', default=5)
-    argparser.add_argument('--k_qry', type=int, help='k shot for query set', default=15)
-    argparser.add_argument('--imgsz', type=int, help='imgsz', default=128)
-    argparser.add_argument('--imgc', type=int, help='imgc', default=3)
-    argparser.add_argument('--task_num', type=int, help='meta batch size, namely task num', default=4)
-    argparser.add_argument('--meta_lr', type=float, help='meta-level outer learning rate', default=0.0005)
-    argparser.add_argument('--update_lr', type=float, help='task-level inner update learning rate', default=0.005)
-    argparser.add_argument('--update_step', type=int, help='task-level inner update steps', default=5)
-    argparser.add_argument('--update_step_test', type=int, help='update steps for finetunning', default=10)
-    
-    # 预训练权重相关参数
-    argparser.add_argument('--pretrained_path', type=str, help='预训练权重路径', default=None)
-    argparser.add_argument('--freeze_backbone', action='store_true', help='是否冻结主干网络', default=True)
-    argparser.add_argument('--no_freeze_backbone', dest='freeze_backbone', action='store_false', help='不冻结主干网络')
-
-    args = argparser.parse_args()
     main()

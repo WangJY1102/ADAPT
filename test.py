@@ -16,10 +16,10 @@ class Net(nn.Module):
         return self.a[0]
 
 
-class ADAPT(nn.Module):
+class MAML(nn.Module):
 
     def __init__(self):
-        super(ADAPT, self).__init__()
+        super(MAML, self).__init__()
 
         self.net = Net()
 
@@ -29,9 +29,9 @@ class ADAPT(nn.Module):
 
 def main():
     device = torch.device('cuda')
-    adapt = ADAPT().to(device)
-    print(adapt.net.a)
-    print(adapt.net.b0)
+    maml = MAML().to(device)
+    print(maml.net.a)
+    print(maml.net.b0)
 
 
 if __name__ == '__main__':
